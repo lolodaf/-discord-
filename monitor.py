@@ -47,11 +47,15 @@ if msg:
     else:
         last_id = ""
 
-    if msg_id != last_id:
-        print(f"新消息: {content}")
+   if msg_id != last_id:
+        # 修改点：只打印“发现新消息”，不要打印 content 变量
+        print(">>> 发现新消息，正在推送...") 
+        
+        # 发送给钉钉（这一步是私密的，只有你能收到，放心）
         send_dingtalk(f"用户: {author}\n内容: {content}")
+        
         # 保存 ID
         with open(LAST_MSG_FILE, "w") as f:
             f.write(msg_id)
     else:
-        print("无新消息")
+        print("... 监控中，无新消息 ...")
