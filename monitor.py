@@ -1,104 +1,108 @@
 import requests
 import json
 import os
+import time
+import threading
+from flask import Flask
 
-# --- 核心增强逻辑 ---
-def get_clean_ids():
-    """读取并清洗 ID，自动处理中文逗号、空格、换行符"""
-    raw_input = os.getenv("CHANNEL_ID", "")
-    
-    # 1. 自动把中文逗号换成英文逗号
-    if "，" in raw_input:
-        raw_input = raw_input.replace("，", ",")
-    
-    # 2. 分割后逐个清洗
-    clean_ids = []
-    for raw_id in raw_input.split(","):
-        # 这一步会把 ID 里所有非数字的字符（空格、回车等）全部删掉
-        clean_id = "".join(filter(str.isdigit, raw_id))
-        if clean_id:
-            clean_ids.append(clean_id)
-            
-    if not clean_ids:
-        print("❌ 错误：没有检测到有效的数字 ID，请检查 Secrets 设置！")
-    else:
-        print(f"✅ 成功读取 {len(clean_ids)} 个有效频道 ID")
-        
-    return clean_ids
-
-# 读取配置
+# --- 配置加载与清洗模块 ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_IDS = get_clean_ids() # 使用增强版函数读取
-DINGTALK_URL = os.getenv("DINGTALK_URL")
-LAST_MSG_FILE = "last_msg_id.txt"
+history = {}
 
+def clean_ids(raw_input):
+    """清洗频道ID字符串，处理中文逗号和空格"""
+    if not raw_input: return []
+    if "，" in raw_input: raw_input = raw_input.replace("，", ",")
+    clean_ids = ["".join(filter(str.isdigit, raw_id)) for raw_id in raw_input.split(",")]
+    return [cid for cid in clean_ids if cid]
+
+def load_config():
+    """动态加载多组频道和对应的钉钉机器人"""
+    config_list = []
+    
+    # 兼容老的写法（如果没有数字后缀）
+    ch_env = os.getenv("CHANNEL_ID")
+    webhook = os.getenv("DINGTALK_URL")
+    if ch_env and webhook:
+        config_list.append({"channels": clean_ids(ch_env), "webhook": webhook})
+        
+    # 自动扫描带数字的变量名 1 到 10 (例如 CHANNEL_ID1, DINGTALK_URL1)
+    for i in range(1, 11):
+        ch_env = os.getenv(f"CHANNEL_ID{i}")
+        webhook = os.getenv(f"DINGTALK_URL{i}")
+        
+        if ch_env and webhook:
+            config_list.append({
+                "group_name": f"第{i}组",
+                "channels": clean_ids(ch_env), 
+                "webhook": webhook
+            })
+            
+    return config_list
+
+# 载入配置
+CONFIG_LIST = load_config()
+
+# --- 核心网络请求模块 ---
 def get_latest_message(channel_id):
     url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=1"
     headers = {"Authorization": DISCORD_TOKEN, "Content-Type": "application/json"}
     try:
-        # 增加 timeout 防止卡死
-        res = requests.get(url, headers=headers, timeout=15)
-        if res.status_code == 200:
-            return res.json()[0]
-        elif res.status_code == 401:
-            print(f"❌ 权限不足 (401)，请检查 DISCORD_TOKEN 是否过期")
-        elif res.status_code == 404:
-            print(f"❌ 频道不存在 (404)，ID: {channel_id} 可能填错了")
-        else:
-            print(f"⚠️ 获取失败 {channel_id}: {res.status_code}")
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200: return res.json()[0]
     except Exception as e:
-        print(f"❌ 请求出错: {e}")
+        pass
     return None
 
-def send_dingtalk(content):
+def send_dingtalk(webhook, content):
+    if not webhook: return
     headers = {"Content-Type": "application/json"}
-    data = {
-        "msgtype": "text",
-        "text": {
-            "content": f"[Discord监控]\n{content}"
-        }
-    }
+    data = {"msgtype": "text", "text": {"content": f"[Discord监控]\n{content}"}}
     try:
-        requests.post(DINGTALK_URL, headers=headers, data=json.dumps(data), timeout=10)
+        requests.post(webhook, headers=headers, data=json.dumps(data), timeout=10)
     except:
         pass
 
-# --- 主逻辑 ---
-history = {}
-# 读取旧记录
-if os.path.exists(LAST_MSG_FILE):
-    try:
-        with open(LAST_MSG_FILE, "r") as f:
-            content = f.read().strip()
-            if content.startswith("{"):
-                history = json.loads(content)
-    except:
-        history = {}
+# --- 后台死循环任务 ---
+def background_monitor():
+    global history
+    print(f"🚀 监控已启动！共加载了 {len(CONFIG_LIST)} 组推送配置。每 60 秒检查一次...")
+    while True:
+        # 遍历每一组配置
+        for item in CONFIG_LIST:
+            webhook = item["webhook"]
+            # 遍历这组配置下的所有频道ID
+            for channel_id in item["channels"]:
+                msg = get_latest_message(channel_id)
+                if msg:
+                    msg_id = msg['id']
+                    author = msg.get('author', {}).get('username', '未知')
+                    content = msg.get('content', '[图片/附件]')
+                    
+                    last_id = history.get(channel_id, "")
+                    if last_id and msg_id != last_id: # 发现新消息且不是第一次启动
+                        print(f">>> 频道 {channel_id} 有新消息！发往对应的钉钉。")
+                        send_dingtalk(webhook, f"频道: {channel_id}\n用户: {author}\n内容: {content}")
+                    
+                    # 更新历史记录
+                    history[channel_id] = msg_id
+                    
+        # 检查完所有组，休息 60 秒
+        time.sleep(60)
 
-has_update = False
+# --- 假网站防休眠模块 (Render 必备) ---
+app = Flask(__name__)
 
-# 循环检查
-for channel_id in CHANNEL_IDS:
-    msg = get_latest_message(channel_id)
+@app.route('/')
+def keep_alive():
+    return f"Bot is running! Total active groups: {len(CONFIG_LIST)} ✅"
+
+if __name__ == '__main__':
+    # 启动后台监控线程
+    t = threading.Thread(target=background_monitor)
+    t.daemon = True
+    t.start()
     
-    if msg:
-        msg_id = msg['id']
-        author = msg.get('author', {}).get('username', '未知')
-        content = msg.get('content', '[图片/附件]')
-        
-        last_id = history.get(channel_id, "")
-        
-        if msg_id != last_id:
-            print(f">>> 频道 {channel_id} 发现新消息！")
-            send_dingtalk(f"频道: {channel_id}\n用户: {author}\n内容: {content}")
-            history[channel_id] = msg_id
-            has_update = True
-        else:
-            print(f"频道 {channel_id} 无新消息")
-
-# 只有当发现更新时，或者文件不存在时，才写入文件
-# 这能解决 'pathspec' 找不到文件的报错
-if has_update or not os.path.exists(LAST_MSG_FILE):
-    with open(LAST_MSG_FILE, "w") as f:
-        json.dump(history, f)
-    print("✅ 记录文件已更新")
+    # 启动假网站监听
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
