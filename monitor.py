@@ -3,6 +3,7 @@ import json
 import os
 import time
 import threading
+from datetime import datetime, timezone, timedelta
 from flask import Flask
 
 # --- 配置加载与清洗模块 ---
@@ -84,6 +85,20 @@ def send_dingtalk(webhook, content):
     except Exception as e:
         print(f"发送钉钉失败: {e}")
 
+def format_discord_time(raw_time_str):
+    """将 Discord 的 UTC 时间转换为东八区（北京/新加坡）时间字符串"""
+    if not raw_time_str:
+        return "未知时间"
+    try:
+        # Discord 返回格式如 "2023-10-24T12:00:00.000000+00:00"
+        dt_utc = datetime.fromisoformat(raw_time_str.replace('Z', '+00:00'))
+        tz_utc_8 = timezone(timedelta(hours=8))
+        dt_local = dt_utc.astimezone(tz_utc_8)
+        return dt_local.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        # 如果解析失败，原样返回
+        return raw_time_str
+
 # --- 后台死循环任务 ---
 def background_monitor():
     global history
@@ -93,7 +108,7 @@ def background_monitor():
         for item in CONFIG_LIST:
             webhook = item["webhook"]
             for channel_id in item["channels"]:
-                # 1. 获取最近的多条消息 (比如20条，足以覆盖一分钟内的消息量)
+                # 1. 获取最近的多条消息 (默认20条)
                 messages = get_recent_messages(channel_id, limit=20)
                 
                 if messages:
@@ -117,14 +132,29 @@ def background_monitor():
                         
                         # reversed() 将列表倒序，变成 [旧, 较新, 最新]
                         for msg in reversed(new_messages_to_send):
-                            author = msg.get('author', {}).get('username', '未知')
+                            # --- 提取信息：昵称、时间、内容 ---
+                            
+                            # 优先获取服务器昵称 (nick)，如果为空则回退到全局用户名 (username)
+                            member_info = msg.get('member', {})
+                            author_username = msg.get('author', {}).get('username', '未知')
+                            author_nick = member_info.get('nick')
+                            
+                            # 考虑到 author_nick 可能存在但值为 None 的情况
+                            author = author_nick if author_nick else author_username
+                            
+                            # 格式化时间为东八区
+                            formatted_time = format_discord_time(msg.get('timestamp', ''))
+
                             content = msg.get('content', '')
                             # 处理可能存在的附件或图片
                             if not content and msg.get('attachments'):
                                 content = '[图片/附件]'
                                 
                             print(f">>> 频道 [{channel_name}] 有新消息！发往对应的钉钉。")
-                            send_dingtalk(webhook, f"频道: {channel_name}\n用户: {author}\n内容: {content}")
+                            
+                            # 发送给钉钉，包含时间
+                            dingtalk_msg = f"频道: {channel_name}\n时间: {formatted_time}\n用户: {author}\n内容: {content}"
+                            send_dingtalk(webhook, dingtalk_msg)
                             
                             # 每次发送后停顿 2 秒，防止触发钉钉限流
                             time.sleep(2) 
