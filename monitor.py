@@ -8,7 +8,7 @@ from flask import Flask
 # --- 配置加载与清洗模块 ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 history = {}
-CHANNEL_NAMES_CACHE = {} # 新增：用来存查到的频道名字，查过一次就不查了
+CHANNEL_NAMES_CACHE = {} # 用来存查到的频道名字，查过一次就不查了
 
 def clean_ids(raw_input):
     """清洗频道ID字符串，处理中文逗号和空格"""
@@ -63,15 +63,17 @@ def get_channel_name(channel_id):
     
     return channel_id # 如果万一查失败了，就先用数字 ID 顶替
 
-def get_latest_message(channel_id):
-    url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=1"
+def get_recent_messages(channel_id, limit=20):
+    """获取最近的多条消息，默认拉取20条"""
+    url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit={limit}"
     headers = {"Authorization": DISCORD_TOKEN, "Content-Type": "application/json"}
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200: return res.json()[0]
+        if res.status_code == 200: 
+            return res.json()
     except Exception as e:
         pass
-    return None
+    return []
 
 def send_dingtalk(webhook, content):
     if not webhook: return
@@ -79,33 +81,58 @@ def send_dingtalk(webhook, content):
     data = {"msgtype": "text", "text": {"content": f"[Discord监控]\n{content}"}}
     try:
         requests.post(webhook, headers=headers, data=json.dumps(data), timeout=10)
-    except:
-        pass
+    except Exception as e:
+        print(f"发送钉钉失败: {e}")
 
 # --- 后台死循环任务 ---
 def background_monitor():
     global history
     print(f"🚀 监控已启动！共加载了 {len(CONFIG_LIST)} 组推送配置。每 60 秒检查一次...")
+    
     while True:
         for item in CONFIG_LIST:
             webhook = item["webhook"]
             for channel_id in item["channels"]:
-                msg = get_latest_message(channel_id)
-                if msg:
-                    msg_id = msg['id']
-                    author = msg.get('author', {}).get('username', '未知')
-                    content = msg.get('content', '[图片/附件]')
-                    
+                # 1. 获取最近的多条消息 (比如20条，足以覆盖一分钟内的消息量)
+                messages = get_recent_messages(channel_id, limit=20)
+                
+                if messages:
                     last_id = history.get(channel_id, "")
-                    if last_id and msg_id != last_id: 
-                        # 发现新消息！先去查一下这个频道的真名
+                    new_messages_to_send = []
+                    
+                    # 2. 如果之前有记录 last_id，则开始筛选新消息
+                    if last_id:
+                        for msg in messages:
+                            # 遍历直到遇到上次记录的最后一条消息ID
+                            if msg['id'] == last_id:
+                                break
+                            new_messages_to_send.append(msg)
+                    else:
+                        # 如果是第一次运行（没有历史记录），为了防止刷屏，只发送最新的一条
+                        new_messages_to_send = [messages[0]]
+                    
+                    # 3. 按时间顺序（从旧到新）发送新消息
+                    if new_messages_to_send:
                         channel_name = get_channel_name(channel_id)
                         
-                        print(f">>> 频道 [{channel_name}] 有新消息！发往对应的钉钉。")
-                        send_dingtalk(webhook, f"频道: {channel_name}\n用户: {author}\n内容: {content}")
+                        # reversed() 将列表倒序，变成 [旧, 较新, 最新]
+                        for msg in reversed(new_messages_to_send):
+                            author = msg.get('author', {}).get('username', '未知')
+                            content = msg.get('content', '')
+                            # 处理可能存在的附件或图片
+                            if not content and msg.get('attachments'):
+                                content = '[图片/附件]'
+                                
+                            print(f">>> 频道 [{channel_name}] 有新消息！发往对应的钉钉。")
+                            send_dingtalk(webhook, f"频道: {channel_name}\n用户: {author}\n内容: {content}")
+                            
+                            # 每次发送后停顿 2 秒，防止触发钉钉限流
+                            time.sleep(2) 
                     
-                    history[channel_id] = msg_id
+                    # 4. 更新历史记录为这批消息中绝对最新的一条（即列表的第 0 项）
+                    history[channel_id] = messages[0]['id']
                     
+        # 5. 整个大循环结束后，等待 60 秒再次检查
         time.sleep(60)
 
 # --- 假网站防休眠模块 ---
