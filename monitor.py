@@ -9,46 +9,38 @@ from flask import Flask
 # --- 配置加载与清洗模块 ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 history = {}
-CHANNEL_NAMES_CACHE = {} # 用来存查到的频道名字，查过一次就不查了
+CHANNEL_NAMES_CACHE = {} 
 
 def clean_ids(raw_input):
-    """清洗频道ID字符串，处理中文逗号和空格"""
     if not raw_input: return []
     if "，" in raw_input: raw_input = raw_input.replace("，", ",")
     clean_ids = ["".join(filter(str.isdigit, raw_id)) for raw_id in raw_input.split(",")]
     return [cid for cid in clean_ids if cid]
 
 def load_config():
-    """动态加载多组频道和对应的钉钉机器人"""
     config_list = []
-    
-    # 兼容老的写法
     ch_env = os.getenv("CHANNEL_ID")
     webhook = os.getenv("DINGTALK_URL")
     if ch_env and webhook:
         config_list.append({"channels": clean_ids(ch_env), "webhook": webhook})
         
-    # 自动扫描带数字的变量名 1 到 10
     for i in range(1, 11):
         ch_env = os.getenv(f"CHANNEL_ID{i}")
         webhook = os.getenv(f"DINGTALK_URL{i}")
-        
         if ch_env and webhook:
             config_list.append({
                 "group_name": f"第{i}组",
                 "channels": clean_ids(ch_env), 
                 "webhook": webhook
             })
-            
     return config_list
 
 CONFIG_LIST = load_config()
 
 # --- 核心网络请求模块 ---
 def get_channel_name(channel_id):
-    """自动拿着 ID 去问 Discord 这个频道叫什么名字"""
     if channel_id in CHANNEL_NAMES_CACHE:
-        return CHANNEL_NAMES_CACHE[channel_id] # 脑子里有就直接用
+        return CHANNEL_NAMES_CACHE[channel_id] 
         
     url = f"https://discord.com/api/v9/channels/{channel_id}"
     headers = {"Authorization": DISCORD_TOKEN, "Content-Type": "application/json"}
@@ -57,15 +49,13 @@ def get_channel_name(channel_id):
         if res.status_code == 200:
             name = res.json().get('name')
             if name:
-                CHANNEL_NAMES_CACHE[channel_id] = name # 查到了就记在脑子里
+                CHANNEL_NAMES_CACHE[channel_id] = name 
                 return name
     except Exception as e:
         pass
-    
-    return channel_id # 如果万一查失败了，就先用数字 ID 顶替
+    return channel_id 
 
 def get_recent_messages(channel_id, limit=20):
-    """获取最近的多条消息，默认拉取20条"""
     url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit={limit}"
     headers = {"Authorization": DISCORD_TOKEN, "Content-Type": "application/json"}
     try:
@@ -76,27 +66,31 @@ def get_recent_messages(channel_id, limit=20):
         pass
     return []
 
-def send_dingtalk(webhook, content):
+# ⚠️ 这里修改成了 Markdown 格式发送
+def send_dingtalk_markdown(webhook, title, md_content):
     if not webhook: return
     headers = {"Content-Type": "application/json"}
-    data = {"msgtype": "text", "text": {"content": f"[Discord监控]\n{content}"}}
+    data = {
+        "msgtype": "markdown",
+        "markdown": {
+            "title": title, # 这是钉钉消息列表预览显示的标题
+            "text": f"### [Discord监控]\n{md_content}" # 这是点开后看到的实际内容
+        }
+    }
     try:
         requests.post(webhook, headers=headers, data=json.dumps(data), timeout=10)
     except Exception as e:
         print(f"发送钉钉失败: {e}")
 
 def format_discord_time(raw_time_str):
-    """将 Discord 的 UTC 时间转换为东八区（北京/新加坡）时间字符串"""
     if not raw_time_str:
         return "未知时间"
     try:
-        # Discord 返回格式如 "2023-10-24T12:00:00.000000+00:00"
         dt_utc = datetime.fromisoformat(raw_time_str.replace('Z', '+00:00'))
         tz_utc_8 = timezone(timedelta(hours=8))
         dt_local = dt_utc.astimezone(tz_utc_8)
         return dt_local.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        # 如果解析失败，原样返回
         return raw_time_str
 
 # --- 后台死循环任务 ---
@@ -108,61 +102,67 @@ def background_monitor():
         for item in CONFIG_LIST:
             webhook = item["webhook"]
             for channel_id in item["channels"]:
-                # 1. 获取最近的多条消息 (默认20条)
                 messages = get_recent_messages(channel_id, limit=20)
                 
                 if messages:
                     last_id = history.get(channel_id, "")
                     new_messages_to_send = []
                     
-                    # 2. 如果之前有记录 last_id，则开始筛选新消息
                     if last_id:
                         for msg in messages:
-                            # 遍历直到遇到上次记录的最后一条消息ID
                             if msg['id'] == last_id:
                                 break
                             new_messages_to_send.append(msg)
                     else:
-                        # 如果是第一次运行（没有历史记录），为了防止刷屏，只发送最新的一条
                         new_messages_to_send = [messages[0]]
                     
-                    # 3. 按时间顺序（从旧到新）发送新消息
                     if new_messages_to_send:
                         channel_name = get_channel_name(channel_id)
                         
-                        # reversed() 将列表倒序，变成 [旧, 较新, 最新]
                         for msg in reversed(new_messages_to_send):
-                            # --- 提取信息：昵称、时间、内容 ---
-                            
-                            # 优先获取服务器昵称 (nick)，如果为空则回退到全局用户名 (username)
+                            # 提取昵称和时间
                             member_info = msg.get('member', {})
                             author_username = msg.get('author', {}).get('username', '未知')
                             author_nick = member_info.get('nick')
-                            
-                            # 考虑到 author_nick 可能存在但值为 None 的情况
                             author = author_nick if author_nick else author_username
-                            
-                            # 格式化时间为东八区
                             formatted_time = format_discord_time(msg.get('timestamp', ''))
 
+                            # 提取文字内容和附件
                             content = msg.get('content', '')
-                            # 处理可能存在的附件或图片
-                            if not content and msg.get('attachments'):
-                                content = '[图片/附件]'
-                                
+                            attachments = msg.get('attachments', [])
+                            
+                            # --- 组装 Markdown 消息 ---
+                            # 注意：钉钉 Markdown 换行建议使用两格空格加 \n，或者直接 \n\n
+                            md_text = f"**频道**: {channel_name}\n\n**时间**: {formatted_time}\n\n**用户**: {author}\n\n"
+                            
+                            if content:
+                                md_text += f"**内容**: \n> {content}\n\n"
+                            
+                            # 处理附件（如果是图片就展示，如果是文件就提供下载链接）
+                            if attachments:
+                                for att in attachments:
+                                    url = att.get('url', '')
+                                    file_name = att.get('filename', '附件')
+                                    
+                                    # 剥离可能存在的 URL 参数（如 ?ex=...）来判断后缀
+                                    url_no_params = url.split('?')[0].lower()
+                                    
+                                    if any(url_no_params.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
+                                        # 图片格式
+                                        md_text += f"![图片]({url})\n\n"
+                                    else:
+                                        # 其他文件格式 (例如 zip, pdf, mp4 等)
+                                        md_text += f"[📁 点击下载/查看文件: {file_name}]({url})\n\n"
+                            
                             print(f">>> 频道 [{channel_name}] 有新消息！发往对应的钉钉。")
                             
-                            # 发送给钉钉，包含时间
-                            dingtalk_msg = f"频道: {channel_name}\n时间: {formatted_time}\n用户: {author}\n内容: {content}"
-                            send_dingtalk(webhook, dingtalk_msg)
+                            # 发送给钉钉 (调用刚才修改好的 Markdown 函数)
+                            send_dingtalk_markdown(webhook, f"新消息: {channel_name}", md_text)
                             
-                            # 每次发送后停顿 2 秒，防止触发钉钉限流
                             time.sleep(2) 
                     
-                    # 4. 更新历史记录为这批消息中绝对最新的一条（即列表的第 0 项）
                     history[channel_id] = messages[0]['id']
                     
-        # 5. 整个大循环结束后，等待 60 秒再次检查
         time.sleep(60)
 
 # --- 假网站防休眠模块 ---
