@@ -66,15 +66,14 @@ def get_recent_messages(channel_id, limit=20):
         pass
     return []
 
-# ⚠️ 这里修改成了 Markdown 格式发送
 def send_dingtalk_markdown(webhook, title, md_content):
     if not webhook: return
     headers = {"Content-Type": "application/json"}
     data = {
         "msgtype": "markdown",
         "markdown": {
-            "title": title, # 这是钉钉消息列表预览显示的标题
-            "text": f"### [Discord监控]\n{md_content}" # 这是点开后看到的实际内容
+            "title": title, 
+            "text": f"### [Discord监控]\n{md_content}" 
         }
     }
     try:
@@ -120,45 +119,72 @@ def background_monitor():
                         channel_name = get_channel_name(channel_id)
                         
                         for msg in reversed(new_messages_to_send):
-                            # 提取昵称和时间
+                            # 1. 提取昵称和时间
                             member_info = msg.get('member', {})
                             author_username = msg.get('author', {}).get('username', '未知')
                             author_nick = member_info.get('nick')
                             author = author_nick if author_nick else author_username
                             formatted_time = format_discord_time(msg.get('timestamp', ''))
 
-                            # 提取文字内容和附件
+                            # 2. 提取是否是【回复】或【转发】的消息
+                            quote_text = ""
+                            # 处理回复 (Reply)
+                            if 'referenced_message' in msg and msg['referenced_message']:
+                                ref_msg = msg['referenced_message']
+                                ref_author = ref_msg.get('member', {}).get('nick') or ref_msg.get('author', {}).get('username', '未知')
+                                ref_content = ref_msg.get('content', '')
+                                if not ref_content: ref_content = "[图片/文件]"
+                                if len(ref_content) > 100: ref_content = ref_content[:100] + "..."
+                                quote_text += f"> **回复 {ref_author}**: {ref_content}\n\n"
+                            
+                            # 处理转发 (Forward)
+                            if 'message_snapshots' in msg and msg['message_snapshots']:
+                                snap_msg = msg['message_snapshots'][0].get('message', {})
+                                snap_content = snap_msg.get('content', '')
+                                if not snap_content: snap_content = "[图片/文件]"
+                                if len(snap_content) > 100: snap_content = snap_content[:100] + "..."
+                                quote_text += f"> **转发消息**: {snap_content}\n\n"
+
+                            # 3. 提取主体文字内容
                             content = msg.get('content', '')
-                            attachments = msg.get('attachments', [])
                             
-                            # --- 组装 Markdown 消息 ---
-                            # 注意：钉钉 Markdown 换行建议使用两格空格加 \n，或者直接 \n\n
+                            # --- 组装 Markdown 基础消息 ---
                             md_text = f"**频道**: {channel_name}\n\n**时间**: {formatted_time}\n\n**用户**: {author}\n\n"
-                            
+                            if quote_text:
+                                md_text += quote_text
                             if content:
-                                md_text += f"**内容**: \n> {content}\n\n"
+                                md_text += f"**内容**: \n{content}\n\n"
                             
-                            # 处理附件（如果是图片就展示，如果是文件就提供下载链接）
+                            # 4. 处理原生附件 (图片直接展示，避免裂图；文件给链接)
+                            attachments = msg.get('attachments', [])
                             if attachments:
                                 for att in attachments:
-                                    url = att.get('url', '')
+                                    # 重点修复：使用 proxy_url 替代原生 url，能大幅度解决钉钉裂图(灰块)问题
+                                    url = att.get('proxy_url') or att.get('url', '')
                                     file_name = att.get('filename', '附件')
+                                    content_type = att.get('content_type', '')
                                     
-                                    # 剥离可能存在的 URL 参数（如 ?ex=...）来判断后缀
-                                    url_no_params = url.split('?')[0].lower()
-                                    
-                                    if any(url_no_params.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
-                                        # 图片格式
+                                    if content_type.startswith('image/') or any(url.split('?')[0].lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
                                         md_text += f"![图片]({url})\n\n"
                                     else:
-                                        # 其他文件格式 (例如 zip, pdf, mp4 等)
                                         md_text += f"[📁 点击下载/查看文件: {file_name}]({url})\n\n"
                             
+                            # 5. 处理网站内嵌预览 (解决 Tenor GIF 变文本链接的问题)
+                            embeds = msg.get('embeds', [])
+                            if embeds:
+                                for embed in embeds:
+                                    # 去找 embed 里面真实的图片/GIF地址
+                                    pic_url = embed.get('thumbnail', {}).get('proxy_url') or embed.get('thumbnail', {}).get('url')
+                                    if not pic_url:
+                                        pic_url = embed.get('image', {}).get('proxy_url') or embed.get('image', {}).get('url')
+                                        
+                                    if pic_url:
+                                        md_text += f"![GIF/预览图]({pic_url})\n\n"
+
                             print(f">>> 频道 [{channel_name}] 有新消息！发往对应的钉钉。")
                             
-                            # 发送给钉钉 (调用刚才修改好的 Markdown 函数)
+                            # 发送给钉钉
                             send_dingtalk_markdown(webhook, f"新消息: {channel_name}", md_text)
-                            
                             time.sleep(2) 
                     
                     history[channel_id] = messages[0]['id']
