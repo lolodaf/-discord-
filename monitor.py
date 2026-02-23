@@ -78,19 +78,21 @@ def format_discord_time(raw_time_str):
     except: return raw_time_str
 
 def get_proxied_image_url(discord_url):
-    """利用全球公益代理突破钉钉无法访问Discord图片的问题 (&n=-1 保持GIF不静止)"""
+    """利用全球公益代理突破钉钉无法访问Discord图片的问题"""
+    if not discord_url: return ""
     encoded = urllib.parse.quote(discord_url, safe='')
     return f"https://wsrv.nl/?url={encoded}&n=-1"
 
 def extract_readable_content(msg_obj):
-    """深度提取文字：包括机器人发的 Embeds 里的标题和正文"""
+    """深度提取文字：不仅提取普通文本，还能把复杂的灰色内嵌卡片（Embed）格式化出来"""
     text = msg_obj.get('content', '')
     embeds = msg_obj.get('embeds', [])
     for e in embeds:
-        if e.get('title'): text += f"\n【{e['title']}】"
-        if e.get('description'): text += f"\n{e['description']}"
+        text += "\n\n" # 为卡片留出空行
+        if e.get('title'): text += f"**【{e['title']}】**\n"
+        if e.get('description'): text += f"{e['description']}\n"
         for field in e.get('fields', []):
-            text += f"\n- {field.get('name', '')}: {field.get('value', '')}"
+            text += f"- **{field.get('name', '')}**: {field.get('value', '')}\n"
     return text.strip()
 
 # --- 后台死循环任务 ---
@@ -121,13 +123,10 @@ def background_monitor():
                             # 1. 发送者与时间
                             author = msg.get('member', {}).get('nick') or msg.get('author', {}).get('username', '未知')
                             formatted_time = format_discord_time(msg.get('timestamp', ''))
-
-                            # 2. 正文提取 (包含卡片文本)
-                            content_text = extract_readable_content(msg)
                             
                             md_text = f"**频道**: {channel_name}\n\n**时间**: {formatted_time}\n\n**用户**: {author}\n\n"
 
-                            # 3. 深度解析回复内容 (解决图1问题)
+                            # 2. 深度解析回复内容 (回复某人)
                             if msg.get('referenced_message'):
                                 ref_msg = msg['referenced_message']
                                 ref_author = ref_msg.get('member', {}).get('nick') or ref_msg.get('author', {}).get('username', '未知')
@@ -135,20 +134,32 @@ def background_monitor():
                                 if not ref_content: ref_content = "[图片/文件/特殊卡片]"
                                 # 格式化为 Markdown 引用块
                                 quoted = '> ' + '\n> '.join(ref_content.split('\n'))
-                                md_text += f"**回复 {ref_author}**:\n{quoted}\n\n"
+                                md_text += f"**回复 {ref_author}**:\n\n{quoted}\n\n"
                             
-                            # 4. 深度解析转发内容
+                            # 3. 🎯 深度解析转发内容 (解决你的截图问题)
                             if msg.get('message_snapshots'):
                                 for snap in msg['message_snapshots']:
-                                    snap_content = extract_readable_content(snap.get('message', {}))
-                                    if not snap_content: snap_content = "[图片/文件/特殊卡片]"
+                                    snap_msg = snap.get('message', {})
+                                    snap_content = extract_readable_content(snap_msg)
+                                    
+                                    # 如果转发的内容里还带了图片，也一并抓出来！
+                                    for att in snap_msg.get('attachments', []):
+                                        url = att.get('url', '')
+                                        if any(url.split('?')[0].lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
+                                            safe_img = get_proxied_image_url(url)
+                                            snap_content += f"\n\n![转发的图片]({safe_img})"
+                                    
+                                    if not snap_content: snap_content = "[复杂多媒体卡片]"
+                                    # 变成钉钉的灰色引用块
                                     quoted = '> ' + '\n> '.join(snap_content.split('\n'))
-                                    md_text += f"**转发消息**:\n{quoted}\n\n"
+                                    md_text += f"**🔄 转发了消息**:\n\n{quoted}\n\n"
 
+                            # 4. 用户自己打的字 (比如截图底部的那个 🫡 表情)
+                            content_text = extract_readable_content(msg)
                             if content_text:
                                 md_text += f"**内容**:\n{content_text}\n\n"
 
-                            # 5. 附件图片处理 (解决图3问题)
+                            # 5. 用户自己发的附件/图片 (防裂图代理处理)
                             for att in msg.get('attachments', []):
                                 url = att.get('url', '')
                                 file_name = att.get('filename', '附件')
@@ -156,12 +167,11 @@ def background_monitor():
                                 
                                 if c_type.startswith('image/') or any(url.split('?')[0].lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
                                     safe_img = get_proxied_image_url(url)
-                                    # 先展示图片代理，下面再附上一条原链接，双重保险！
-                                    md_text += f"![图片]({safe_img})\n[🔗 如果图片没出来，请点击这里查看原图]({url})\n\n"
+                                    md_text += f"![图片]({safe_img})\n[🔗 点击查看原图]({url})\n\n"
                                 else:
                                     md_text += f"[📁 文件下载: {file_name}]({url})\n\n"
                             
-                            # 6. GIF 与内嵌预览图处理 (解决图2问题)
+                            # 6. GIF 与内嵌预览图处理 (处理 Tenor 等表情包)
                             for e in msg.get('embeds', []):
                                 pic_url = e.get('image', {}).get('url') or e.get('thumbnail', {}).get('url')
                                 if pic_url:
